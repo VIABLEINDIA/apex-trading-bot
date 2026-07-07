@@ -22,7 +22,7 @@ import pandas as pd
 from src import database
 from src.config import settings
 from src.costs import net_pnl as compute_net_pnl
-from src.execution import KotakNeoClient, TickBarAggregator
+from src.execution import KotakNeoClient, TickBarAggregator, reconcile_fill
 from src.features import latest_feature_row
 from src.model import MomentumClassifier
 from src.portfolio import PortfolioManager
@@ -129,9 +129,19 @@ class LiveSession:
             return
 
         result = self.client.place_order(ticker, decision.quantity, transaction_type="BUY")
-        self.portfolio.open_trade(ticker, last_price, decision.quantity, result.order_id, timestamp=now, atr=atr)
+        fill = reconcile_fill(self.client, result.order_id, decision.quantity)
+        if fill.filled_quantity == 0:
+            logger.error(
+                "%s BUY order %s did not fill (status=%s); not opening a position for it.",
+                ticker, result.order_id, fill.order_status,
+            )
+            return
+
+        entry_price = fill.avg_price if fill.avg_price is not None else last_price
+        entry_quantity = fill.filled_quantity
+        self.portfolio.open_trade(ticker, entry_price, entry_quantity, result.order_id, timestamp=now, atr=atr)
         trade_id = database.log_trade_open(
-            ticker, last_price, decision.quantity, result.order_id, is_paper=result.paper
+            ticker, entry_price, entry_quantity, result.order_id, is_paper=result.paper
         )
         self.trade_ids[ticker] = trade_id
 
@@ -140,7 +150,15 @@ class LiveSession:
         and the end-of-day/shutdown flush below."""
         trade = self.portfolio.active_trades[ticker]
         if sell_order and self.client is not None:
-            self.client.place_order(ticker, trade.quantity, transaction_type="SELL")
+            result = self.client.place_order(ticker, trade.quantity, transaction_type="SELL")
+            fill = reconcile_fill(self.client, result.order_id, trade.quantity)
+            if fill.avg_price is not None:
+                exit_price = fill.avg_price
+            if not fill.matches_expected:
+                logger.error(
+                    "%s SELL order %s only filled %d/%d; position may not be fully flat.",
+                    ticker, result.order_id, fill.filled_quantity, trade.quantity,
+                )
         pnl = self.portfolio.close_trade(ticker, exit_price)
         # Estimated, not the broker's actual charged amount (we don't parse
         # the charges/contract-note API) -- same cost model as the backtests,

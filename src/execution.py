@@ -8,6 +8,7 @@ is True (env: LIVE_TRADING=true). This is intentional so the bot can be
 wired end-to-end and observed before it is trusted with real capital.
 """
 import logging
+import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -26,6 +27,19 @@ class OrderResult:
     order_id: str
     status: str
     paper: bool
+
+
+@dataclass
+class FillReport:
+    """What the broker actually confirms for an order, vs. what we assumed
+    when place_order() returned. See README "Known limitations" -- the system
+    previously trusted its own in-memory state and last-seen tick price
+    rather than ever polling order_history for the confirmed fill."""
+    order_id: str
+    order_status: str
+    filled_quantity: int
+    avg_price: float | None
+    matches_expected: bool
 
 
 def to_kotak_trading_symbol(yahoo_ticker: str) -> str:
@@ -135,6 +149,62 @@ class KotakNeoClient:
         order_id = response.get("nOrdNo", "UNKNOWN")
         logger.warning("[LIVE ORDER] %s %s x%d -> order_id=%s", transaction_type, ticker, quantity, order_id)
         return OrderResult(order_id=order_id, status=response.get("stat", "unknown"), paper=False)
+
+    def get_order_status(self, order_id: str) -> dict:
+        """Poll order_history for this order's current broker-side state
+        (ordSt, fldQty, avgPrc, rlzPL). Field names per README "Known
+        limitations" -- confirm against a live session before trusting them
+        in a way that blocks trading, since they were never verified end to
+        end against a real fill.
+
+        order_history returns a list of status updates (oldest first); the
+        last entry is the most current state.
+        """
+        response = self.client.order_history(order_id=order_id)
+        data = response.get("data", response)
+        if isinstance(data, list):
+            return data[-1] if data else {}
+        return data if isinstance(data, dict) else {}
+
+
+def reconcile_fill(client: "KotakNeoClient", order_id: str, expected_quantity: int,
+                    max_attempts: int = 3, poll_interval_seconds: float = 1.0) -> FillReport:
+    """Confirm what the broker actually filled instead of trusting place_order's
+    immediate response and our own last-seen tick price (see README "Known
+    limitations": "we never poll the broker for confirmed fills").
+
+    Paper orders always match by construction -- there's no broker fill to
+    confirm against, so this is a no-op for the default (non-live) path.
+
+    Retries a few times with a short pause: NSE order confirmation isn't
+    always instantaneous, and polling once immediately after placement can
+    race the broker's own processing.
+    """
+    if order_id.startswith("PAPER-"):
+        return FillReport(order_id=order_id, order_status="simulated",
+                           filled_quantity=expected_quantity, avg_price=None, matches_expected=True)
+
+    status: dict = {}
+    for attempt in range(max_attempts):
+        status = client.get_order_status(order_id)
+        if status.get("fldQty") not in (None, "", "0", 0):
+            break
+        if attempt < max_attempts - 1:
+            time.sleep(poll_interval_seconds)
+
+    filled_quantity = int(status.get("fldQty") or 0)
+    avg_price = float(status["avgPrc"]) if status.get("avgPrc") not in (None, "") else None
+    order_status = str(status.get("ordSt", "unknown"))
+    matches_expected = filled_quantity == expected_quantity
+
+    if not matches_expected:
+        logger.warning(
+            "Fill mismatch on order %s: expected qty %d, broker reports %d filled (status=%s)",
+            order_id, expected_quantity, filled_quantity, order_status,
+        )
+
+    return FillReport(order_id=order_id, order_status=order_status, filled_quantity=filled_quantity,
+                       avg_price=avg_price, matches_expected=matches_expected)
 
 
 class TickBarAggregator:
