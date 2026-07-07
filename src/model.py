@@ -44,11 +44,21 @@ class MomentumClassifier:
         return self.train_multi([bars], benchmark_close=benchmark_close, test_size=test_size)
 
     def train_prelabeled(self, training_set: pd.DataFrame, test_size: float = 0.2) -> dict:
-        """Train on a single already featurized+labeled frame with a naive
-        time-ordered split. Prefer `train_multi` when you have several tickers,
-        since splitting *after* concatenation would put entire tickers into the
-        test set instead of a genuine held-out time window."""
-        return self._fit_and_evaluate(training_set, training_set, test_size=test_size)
+        """Train on a single already featurized+labeled frame, split by row
+        order into an earlier train segment and a later test segment --
+        assumes `training_set` is already sorted in time order (e.g. by
+        timestamp). Prefer `train_multi` when you have several tickers
+        concatenated per-ticker without a shared timestamp ordering, since
+        splitting after concatenation would put entire tickers into the test
+        set instead of a genuine held-out time window.
+        """
+        split_at = int(len(training_set) * (1 - test_size))
+        if split_at == 0 or split_at == len(training_set):
+            train_set = test_set = training_set
+        else:
+            train_set = training_set.iloc[:split_at]
+            test_set = training_set.iloc[split_at:]
+        return self._fit_and_evaluate(train_set, test_set, test_size=None)
 
     def train_multi(self, ticker_bars: list[pd.DataFrame], benchmark_close: pd.Series | None = None,
                      test_size: float = 0.2) -> dict:

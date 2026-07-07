@@ -69,6 +69,29 @@ def test_train_prelabeled_uses_precomputed_training_set():
     assert "accuracy" in report
 
 
+def test_train_prelabeled_holds_out_the_last_test_size_fraction_by_row_order():
+    """Regression test: train_prelabeled used to pass the same `training_set`
+    object as both train_set and test_set to _fit_and_evaluate, silently
+    ignoring test_size and evaluating in-sample -- despite its own docstring
+    claiming a time-ordered split. Fixed to actually split by row order."""
+    clf = MomentumClassifier()
+    training_set = build_training_set(make_bars(n=300, seed=7))
+    seen_train_len = {}
+
+    original_fit = clf.model.fit
+
+    def spy_fit(X, y, **kwargs):
+        seen_train_len["n"] = len(X)
+        return original_fit(X, y, **kwargs)
+
+    clf.model.fit = spy_fit
+
+    clf.train_prelabeled(training_set, test_size=0.25)
+
+    assert seen_train_len["n"] < len(training_set)
+    assert seen_train_len["n"] == int(len(training_set) * 0.75)
+
+
 def test_predict_confidence_is_a_probability():
     clf = MomentumClassifier()
     clf.train(make_bars())
