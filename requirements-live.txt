@@ -6,10 +6,10 @@
 # which is incompatible with yfinance (needs websockets>=13). The screener/
 # training/backtesting scripts (which need yfinance) and the live executor
 # (which needs neo_api_client) can never share one Python environment.
-pandas>=2.2
-numpy>=1.26
-scikit-learn>=1.4
-joblib>=1.4
-pyotp>=2.9
-python-dotenv>=1.0
-neo_api_client @ git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git
+pandas==2.2.3
+numpy==2.1.0
+scikit-learn==1.9.0
+joblib==1.5.3
+pyotp==2.10.0
+python-dotenv==1.0.0
+neo_api_client @ git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@8cee5bda63bd9334f8501bb23b7f1d2945f93397

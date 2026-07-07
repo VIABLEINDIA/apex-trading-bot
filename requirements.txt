@@ -1,7 +1,11 @@
-pandas>=2.2
-numpy>=1.26
-yfinance>=0.2.40
-scikit-learn>=1.4
-python-dotenv>=1.0
-joblib>=1.4
-pytest>=8.0
+pandas==3.0.3
+numpy==2.5.1
+yfinance==1.5.1
+scikit-learn==1.9.0
+python-dotenv==1.2.2
+joblib==1.5.3
+pytest==9.1.1
+# pyotp has no conflicting pins (unlike neo_api_client, see requirements-live.txt),
+# so it lives here too: needed to unit-test src/execution.py's login() logic in
+# tests/test_execution.py without ever importing neo_api_client itself.
+pyotp==2.10.0
