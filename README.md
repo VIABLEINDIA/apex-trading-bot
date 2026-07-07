@@ -101,6 +101,10 @@ python scripts/validate_walkforward.py --days 59 --holdout-days 14 --save-model 
 
 ## Risk management: why there's a circuit breaker instead of a per-trade stop-loss
 
+See `docs/decisions/` for ADRs recording the reasoning, alternatives considered,
+and consequences behind each risk-management mechanism below in a more
+structured form than this prose.
+
 `scripts/analyze_stoploss.py` re-fetches the real intraday bar path for every trade logged across the walk-forward runs above (500 trades) and checks what a fixed-% stop-loss would have done:
 
 | Stop threshold | Trades stopped early | Total PnL | Win rate |
