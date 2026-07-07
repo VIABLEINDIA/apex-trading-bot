@@ -1,0 +1,15 @@
+# Dependencies for the LIVE execution process (src/live_session.py) only.
+# Install into a SEPARATE venv from requirements.txt:
+#   python -m venv venv-live && venv-live/bin/pip install -r requirements-live.txt
+#
+# Why separate: neo_api_client pins websockets==8.1 and certifi==2022.12.7,
+# which is incompatible with yfinance (needs websockets>=13). The screener/
+# training/backtesting scripts (which need yfinance) and the live executor
+# (which needs neo_api_client) can never share one Python environment.
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.4
+joblib>=1.4
+pyotp>=2.9
+python-dotenv>=1.0
+neo_api_client @ git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git

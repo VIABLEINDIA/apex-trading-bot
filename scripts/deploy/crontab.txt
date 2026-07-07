@@ -1,0 +1,18 @@
+# Apex Trading Bot - AWS EC2 cron schedule (server time assumed UTC).
+# 03:15 UTC = 08:45 IST (pre-market screener, MAIN venv, yfinance).
+# 10:00 UTC = 15:30 IST (market close / pm2 stop).
+#
+# The screener (venv, yfinance) and the live executor (venv-live, neo_api_client)
+# are two separate processes in two separate venvs -- neo_api_client pins
+# websockets==8.1/certifi==2022.12.7, which conflicts with yfinance's
+# websockets>=13 requirement, so they can never share one environment. The
+# screener runs first and writes data/watchlist.json; pm2 only starts the live
+# session after that succeeds (the && chain).
+#
+# Install with: crontab scripts/deploy/crontab.txt
+# (edit APP_DIR to match the actual deploy path first)
+
+APP_DIR=/home/ubuntu/apex-trading-bot
+
+15 3 * * 1-5 cd $APP_DIR && venv/bin/python -m src.premarket >> logs/cron.log 2>&1 && /usr/local/bin/pm2 start scripts/deploy/ecosystem.config.js >> logs/cron.log 2>&1
+0 10 * * 1-5 cd $APP_DIR && /usr/local/bin/pm2 stop apex-trading-bot >> logs/cron.log 2>&1
