@@ -1,5 +1,7 @@
 # Apex AI Trading Bot
 
+[![tests](https://github.com/VIABLEINDIA/apex-trading-bot/actions/workflows/tests.yml/badge.svg)](https://github.com/VIABLEINDIA/apex-trading-bot/actions/workflows/tests.yml)
+
 Institutional-style, fully automated intraday momentum bot for NSE equities (Nifty 500), built from the "Apex AI Trading Bot" architecture blueprint. Screens the universe pre-market, scores momentum with a GradientBoostingClassifier, enforces a 10-slot portfolio risk cap, and (optionally) routes live orders through Kotak Neo.
 
 ## Safety default: paper trading
