@@ -99,3 +99,19 @@ def net_pnl(entry_price: float, exit_price: float, quantity: int,
     gross = (filled_exit - filled_entry) * quantity
     charges = round_trip_charges(filled_entry, filled_exit, quantity, costs)
     return gross - charges
+
+
+def round_trip_cost_fraction(ts=None, costs: TransactionCosts = DEFAULT_COSTS) -> float:
+    """The round-trip cost of a completely flat (zero raw price move) trade,
+    as a fraction of price -- i.e. the minimum forward move (in either
+    direction) a bar needs to clear before it's profitable net of realistic
+    costs *at all*. Every cost component modeled here (slippage bps,
+    statutory charges) is a percentage of price/turnover, so this fraction is
+    price-invariant; only `ts` (time-of-day slippage bucket) changes it.
+
+    Used to derive a cost-grounded dead-zone threshold for training labels
+    (see src/features.py:add_labels_cost_aware) instead of a guessed
+    constant -- a bar whose forward move doesn't clear this fraction was
+    never going to be a profitable trade regardless of direction.
+    """
+    return -net_pnl(1.0, 1.0, 1, entry_ts=ts, exit_ts=ts, costs=costs)

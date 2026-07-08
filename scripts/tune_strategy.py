@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.market_data import fetch_bars_by_ticker, fetch_benchmark_close  # noqa: E402
 from src.model import MomentumClassifier  # noqa: E402
 from src.portfolio import PortfolioManager  # noqa: E402
+from src.regime import RealizedVolatilityGate  # noqa: E402
 from src.screener import load_universe  # noqa: E402
 from src.universe import load_sector_map  # noqa: E402
 
@@ -50,7 +51,7 @@ logger = logging.getLogger(__name__)
 # regardless of what's computed -- exercises the pre-BALU-strategy baseline
 # (flat sizing, no per-trade stop, full-day trading) as a real candidate,
 # not just an assumption.
-def build_candidates() -> list[tuple[str, dict, bool]]:
+def build_candidates(benchmark_close: pd.Series | None = None) -> list[tuple[str, dict, bool]]:
     candidates = []
 
     # Baseline: mechanism off entirely, full-day trading (no session cutoff).
@@ -109,6 +110,19 @@ def build_candidates() -> list[tuple[str, dict, bool]]:
             True,
         ))
 
+    # Market-regime gate (src/regime.py:RealizedVolatilityGate), applied on
+    # top of the exact baseline_off config (mechanism off, full-day trading)
+    # to isolate the gate's own effect -- same "change one thing at a time"
+    # approach as session_only_no_atr/sizing_only above. Untested until now
+    # (see docs/decisions/ and README: implemented but never backtested).
+    if benchmark_close is not None:
+        gate = RealizedVolatilityGate(benchmark_close)
+        candidates.append((
+            "baseline_off_regime_gated",
+            dict(primary_session_end="15:30", continuation_session_end="15:30", regime_gate=gate),
+            False,
+        ))
+
     return candidates
 
 
@@ -137,7 +151,7 @@ def main() -> None:
     report = model.train_multi(list(train_bars.values()), benchmark_close=train_benchmark_close)
     logger.info("Trained ONCE on pre-cutoff data (%d tickers). Holdout accuracy=%.3f", len(train_bars), report["accuracy"])
 
-    candidates = build_candidates()
+    candidates = build_candidates(benchmark_close)
     logger.info("Sweeping %d configurations against the same held-out window...", len(candidates))
 
     sector_map = load_sector_map()

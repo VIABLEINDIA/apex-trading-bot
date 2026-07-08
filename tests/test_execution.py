@@ -234,3 +234,43 @@ def test_tick_bar_aggregator_returns_empty_frame_for_unknown_ticker():
     bars = agg.get_bars("NOPE.NS")
     assert bars.empty
     assert list(bars.columns) == ["Open", "High", "Low", "Close", "Volume"]
+
+
+def test_tick_bar_aggregator_resolves_open_close_by_timestamp_not_arrival_order():
+    import pandas as pd
+
+    agg = TickBarAggregator(bar_interval="15min")
+    base = pd.Timestamp("2026-01-05 09:15:00", tz="Asia/Kolkata")
+
+    # Tick with the LATER true timestamp (105 @ 09:20) is processed first
+    # (e.g. WebSocket/network reordering); the EARLIER tick (100 @ 09:15)
+    # arrives second. Open/Close must reflect timestamp order, not the order
+    # add_tick happened to be called in.
+    agg.add_tick("RELIANCE.NS", price=105, volume=1, timestamp=base + pd.Timedelta(minutes=5))
+    agg.add_tick("RELIANCE.NS", price=100, volume=1, timestamp=base)
+
+    row = agg.get_bars("RELIANCE.NS").iloc[0]
+    assert row["Open"] == 100
+    assert row["Close"] == 105
+    assert row["High"] == 105
+    assert row["Low"] == 100
+
+
+def test_tick_bar_aggregator_open_survives_a_same_timestamp_tick_processed_later():
+    import pandas as pd
+
+    agg = TickBarAggregator(bar_interval="15min")
+    ts = pd.Timestamp("2026-01-05 09:15:00", tz="Asia/Kolkata")
+
+    # Three ticks share the exact same timestamp (e.g. a batched delivery).
+    # Open must stay pinned to whichever tick set it first; Close should
+    # keep tracking the most recently processed tick at that same instant.
+    agg.add_tick("RELIANCE.NS", price=100, volume=1, timestamp=ts)
+    agg.add_tick("RELIANCE.NS", price=105, volume=1, timestamp=ts)
+    agg.add_tick("RELIANCE.NS", price=98, volume=1, timestamp=ts)
+
+    row = agg.get_bars("RELIANCE.NS").iloc[0]
+    assert row["Open"] == 100
+    assert row["Close"] == 98
+    assert row["High"] == 105
+    assert row["Low"] == 98

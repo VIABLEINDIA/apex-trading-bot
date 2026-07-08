@@ -1,9 +1,10 @@
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.ensemble import GradientBoostingClassifier
 
 from src.features import FEATURE_COLUMNS, build_training_set
-from src.model import MomentumClassifier
+from src.model import EnsembleMomentumClassifier, MomentumClassifier
 
 
 def make_bars(n=200, seed=1):
@@ -112,6 +113,59 @@ def test_is_buy_signal_matches_confidence_threshold(monkeypatch):
     is_buy, confidence = clf.is_buy_signal(row)
 
     assert is_buy == (confidence > settings.risk.confidence_threshold)
+
+
+class _StubMember:
+    """A minimal stand-in for MomentumClassifier that returns a fixed
+    confidence, so ensemble averaging math can be tested independently of
+    real model training."""
+
+    def __init__(self, confidence: float):
+        self.confidence = confidence
+
+    def predict_confidence(self, feature_row: pd.DataFrame) -> float:
+        return self.confidence
+
+
+def test_ensemble_rejects_empty_member_list():
+    with pytest.raises(ValueError):
+        EnsembleMomentumClassifier(members=[])
+
+
+def test_ensemble_with_one_member_matches_that_members_confidence():
+    member = _StubMember(0.73)
+    ensemble = EnsembleMomentumClassifier(members=[member])
+    assert ensemble.predict_confidence(pd.DataFrame()) == pytest.approx(0.73)
+
+
+def test_ensemble_averages_confidence_across_members():
+    ensemble = EnsembleMomentumClassifier(members=[_StubMember(0.4), _StubMember(0.6), _StubMember(0.8)])
+    assert ensemble.predict_confidence(pd.DataFrame()) == pytest.approx(0.6)
+
+
+def test_ensemble_is_buy_signal_uses_averaged_confidence(monkeypatch):
+    from types import SimpleNamespace
+    # settings.risk is a frozen dataclass -- swap the module-level name
+    # model.py reads instead of mutating the real (frozen) instance.
+    monkeypatch.setattr("src.model.settings", SimpleNamespace(risk=SimpleNamespace(confidence_threshold=0.5)))
+    ensemble = EnsembleMomentumClassifier(members=[_StubMember(0.3), _StubMember(0.9)])  # average 0.6
+
+    is_buy, confidence = ensemble.is_buy_signal(pd.DataFrame())
+
+    assert confidence == pytest.approx(0.6)
+    assert is_buy is True
+
+
+def test_ensemble_of_real_trained_classifiers_averages_their_predictions():
+    members = [MomentumClassifier() for _ in range(3)]
+    for i, clf in enumerate(members):
+        clf.train(make_bars(seed=i))
+    row = build_training_set(make_bars(seed=99)).iloc[[0]]
+
+    ensemble = EnsembleMomentumClassifier(members=members)
+    expected = sum(m.predict_confidence(row) for m in members) / len(members)
+
+    assert ensemble.predict_confidence(row) == pytest.approx(expected)
 
 
 def test_save_and_load_round_trip_preserves_predictions(tmp_path):

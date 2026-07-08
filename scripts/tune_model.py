@@ -35,7 +35,7 @@ from sklearn.ensemble import GradientBoostingClassifier
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.features import add_features, add_labels, FEATURE_COLUMNS  # noqa: E402
+from src.features import add_features, add_labels, add_labels_cost_aware, FEATURE_COLUMNS  # noqa: E402
 from src.market_data import fetch_bars_by_ticker, fetch_benchmark_close  # noqa: E402
 from src.model import MomentumClassifier  # noqa: E402
 from src.portfolio import PortfolioManager  # noqa: E402
@@ -60,6 +60,12 @@ def build_variants() -> list[dict]:
         dict(label="horizon3_default_gbm", horizon=3, epsilon=0.0010, gbm_params=default_gbm),
         dict(label="horizon5_default_gbm", horizon=5, epsilon=0.0015, gbm_params=default_gbm),
         dict(label="h1_regularized_gbm", horizon=1, epsilon=0.0005, gbm_params=regularized_gbm),
+        # Dead-zone threshold derived from src/costs.py's real round-trip cost
+        # model (time-of-day slippage + statutory charges) instead of the
+        # fixed, guessed epsilon above -- see src/features.py:add_labels_cost_aware.
+        # `epsilon` is unused here (cost_aware ignores it) but kept in the
+        # dict for a uniform log line across variants.
+        dict(label="h1_cost_aware_default_gbm", horizon=1, epsilon=None, gbm_params=default_gbm, cost_aware=True),
     ]
 
 
@@ -95,14 +101,19 @@ def main() -> None:
 
     for variant in build_variants():
         label, horizon, epsilon, gbm_params = variant["label"], variant["horizon"], variant["epsilon"], variant["gbm_params"]
-        logger.info("--- Variant: %s (horizon=%d, epsilon=%.4f, gbm=%s) ---", label, horizon, epsilon, gbm_params)
+        cost_aware = variant.get("cost_aware", False)
+        logger.info("--- Variant: %s (horizon=%d, epsilon=%s, cost_aware=%s, gbm=%s) ---",
+                    label, horizon, epsilon, cost_aware, gbm_params)
 
         train_frames = []
         for ticker, full_features in ticker_full_features.items():
             pre_cutoff = full_features[full_features.index.normalize() < cutoff]
             if pre_cutoff.empty:
                 continue
-            labeled = add_labels(pre_cutoff, epsilon=epsilon, horizon=horizon).dropna(subset=FEATURE_COLUMNS + ["label"])
+            if cost_aware:
+                labeled = add_labels_cost_aware(pre_cutoff, horizon=horizon).dropna(subset=FEATURE_COLUMNS + ["label"])
+            else:
+                labeled = add_labels(pre_cutoff, epsilon=epsilon, horizon=horizon).dropna(subset=FEATURE_COLUMNS + ["label"])
             if not labeled.empty:
                 train_frames.append(labeled)
 

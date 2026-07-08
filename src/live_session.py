@@ -51,6 +51,10 @@ class LiveSession:
         self.watchlist: list[str] = []
         self.trade_ids: dict[str, int] = {}
         self.last_price: dict[str, float] = {}
+        # Cached benchmark Close series for relative_strength -- only rebuilt
+        # when a NIFTY tick itself lands (see _refresh_benchmark_close), not
+        # on every one of the ~300 watchlist tickers' ticks.
+        self._benchmark_close: pd.Series | None = None
 
     def load_watchlist(self) -> None:
         if not WATCHLIST_PATH.exists():
@@ -84,12 +88,16 @@ class LiveSession:
         ticker = message.get("trading_symbol") or message.get("tk")
         price = float(message.get("ltp", 0) or 0)
         volume = float(message.get("v", 0) or 0)
-        if not ticker or price <= 0:
+        # `not price > 0` (rather than `price <= 0`) also rejects a NaN ltp --
+        # comparisons against NaN are always False, so `price <= 0` would let
+        # a malformed NaN price straight through.
+        if not ticker or not price > 0:
             return
 
         self.aggregator.add_tick(ticker, price, volume, pd.Timestamp.now(tz="Asia/Kolkata"))
 
         if ticker == NIFTY_50_TOKEN:
+            self._refresh_benchmark_close()
             return
 
         self.last_price[ticker] = price
@@ -107,11 +115,19 @@ class LiveSession:
 
         self._evaluate(ticker, price)
 
+    def _refresh_benchmark_close(self) -> None:
+        """Rebuilds the cached Nifty 50 Close series used for the
+        relative_strength feature. Called only when a NIFTY tick itself
+        lands (see _on_tick), not on every stock tick -- the benchmark's own
+        bars only change that often, so rebuilding on every one of the ~300
+        watchlist tickers' ticks would be pure repeated work for no new data.
+        """
+        benchmark_bars = self.aggregator.get_bars(NIFTY_50_TOKEN)
+        self._benchmark_close = benchmark_bars["Close"] if not benchmark_bars.empty else None
+
     def _evaluate(self, ticker: str, last_price: float) -> None:
         bars = self.aggregator.get_bars(ticker)
-        benchmark_bars = self.aggregator.get_bars(NIFTY_50_TOKEN)
-        benchmark_close = benchmark_bars["Close"] if not benchmark_bars.empty else None
-        feature_row = latest_feature_row(bars, benchmark_close=benchmark_close)
+        feature_row = latest_feature_row(bars, benchmark_close=self._benchmark_close)
         if feature_row is None:
             return  # still warming up
 

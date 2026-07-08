@@ -15,6 +15,8 @@ effectively random labels.
 """
 import pandas as pd
 
+from src.costs import round_trip_cost_fraction
+
 FEATURE_COLUMNS = [
     "ema_spread",
     "hl_spread",
@@ -112,6 +114,18 @@ def add_features(bars: pd.DataFrame, benchmark_close: pd.Series | None = None) -
     return df
 
 
+def _dead_zone_label(next_return: pd.Series, epsilon) -> pd.Series:
+    """Shared labeling core for add_labels/add_labels_cost_aware: 1 if the
+    forward return clears +epsilon, 0 if it clears -epsilon, NaN (dropped by
+    the caller's dropna) otherwise. `epsilon` may be a scalar (fixed
+    threshold) or a per-row Series (e.g. a cost-derived, time-of-day-dependent
+    threshold) -- pandas broadcasts the comparison either way."""
+    label = pd.Series(pd.NA, index=next_return.index, dtype="Int64")
+    label[next_return > epsilon] = 1
+    label[next_return < -epsilon] = 0
+    return label
+
+
 def add_labels(bars_with_features: pd.DataFrame, epsilon: float = LABEL_EPSILON, horizon: int = 1) -> pd.DataFrame:
     """Add the binary training label: 1 if the bar `horizon` steps ahead closes
     at least `epsilon` higher than now, 0 if at least `epsilon` lower. Bars
@@ -129,11 +143,7 @@ def add_labels(bars_with_features: pd.DataFrame, epsilon: float = LABEL_EPSILON,
     """
     df = bars_with_features.copy()
     next_return = df["Close"].shift(-horizon) / df["Close"] - 1
-
-    label = pd.Series(pd.NA, index=df.index, dtype="Int64")
-    label[next_return > epsilon] = 1
-    label[next_return < -epsilon] = 0
-    df["label"] = label
+    df["label"] = _dead_zone_label(next_return, epsilon)
     return df
 
 
@@ -141,6 +151,48 @@ def build_training_set(bars: pd.DataFrame, epsilon: float = LABEL_EPSILON,
                         benchmark_close: pd.Series | None = None, horizon: int = 1) -> pd.DataFrame:
     """Full pipeline: features + labels, with warm-up/dead-zone/NaN rows dropped."""
     df = add_labels(add_features(bars, benchmark_close=benchmark_close), epsilon=epsilon, horizon=horizon)
+    return df.dropna(subset=FEATURE_COLUMNS + ["label"])
+
+
+def add_labels_cost_aware(bars_with_features: pd.DataFrame, horizon: int = 1) -> pd.DataFrame:
+    """Same dead-zone label logic as add_labels, but the dead-zone threshold
+    is derived per-bar from src/costs.py's actual round-trip cost model
+    (time-of-day slippage + statutory charges) instead of the fixed,
+    guessed LABEL_EPSILON constant. A bar's forward move must clear what a
+    real round trip would actually cost -- wider near the open/close, where
+    slippage is worse -- before counting as a genuine "up"/"down" label,
+    rather than an arbitrary fixed threshold that's the same size regardless
+    of when the bar happens to fall.
+
+    Purely additive: add_labels/build_training_set/LABEL_EPSILON are
+    unchanged, so no existing training path's numbers shift under it.
+    """
+    df = bars_with_features.copy()
+    next_return = df["Close"].shift(-horizon) / df["Close"] - 1
+
+    # round_trip_cost_fraction only varies by time-of-day bucket (a handful of
+    # distinct windows across a trading day -- see src/costs.py's
+    # TIME_OF_DAY_SLIPPAGE_BPS), so memoize per distinct time() instead of
+    # recomputing the same handful of values once per row across the whole
+    # (potentially multi-ticker, multi-day) frame.
+    cost_by_time: dict = {}
+
+    def _epsilon_for(ts) -> float:
+        t = ts.time()
+        if t not in cost_by_time:
+            cost_by_time[t] = round_trip_cost_fraction(ts)
+        return cost_by_time[t]
+
+    epsilon = pd.Series([_epsilon_for(ts) for ts in df.index], index=df.index)
+    df["label"] = _dead_zone_label(next_return, epsilon)
+    return df
+
+
+def build_training_set_cost_aware(bars: pd.DataFrame, benchmark_close: pd.Series | None = None,
+                                   horizon: int = 1) -> pd.DataFrame:
+    """Full pipeline using the cost-derived dead zone (add_labels_cost_aware)
+    instead of build_training_set's fixed LABEL_EPSILON."""
+    df = add_labels_cost_aware(add_features(bars, benchmark_close=benchmark_close), horizon=horizon)
     return df.dropna(subset=FEATURE_COLUMNS + ["label"])
 
 

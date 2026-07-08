@@ -1,7 +1,9 @@
 import pandas as pd
+import pytest
 
 from src.costs import (
-    TransactionCosts, apply_slippage, net_pnl, round_trip_charges, slippage_bps_for_time,
+    TransactionCosts, apply_slippage, net_pnl, round_trip_charges, round_trip_cost_fraction,
+    slippage_bps_for_time,
 )
 
 
@@ -57,3 +59,33 @@ def test_net_pnl_uses_wider_slippage_at_open_than_midday():
     net_at_open = net_pnl(100.0, 105.0, 100, entry_ts=open_ts, exit_ts=open_ts)
     net_midday = net_pnl(100.0, 105.0, 100, entry_ts=midday_ts, exit_ts=midday_ts)
     assert net_at_open < net_midday
+
+
+def test_round_trip_cost_fraction_is_positive():
+    assert round_trip_cost_fraction() > 0
+
+
+def test_round_trip_cost_fraction_is_wider_at_open_than_midday():
+    open_ts = pd.Timestamp("2024-01-01 09:20")
+    midday_ts = pd.Timestamp("2024-01-01 11:00")
+    assert round_trip_cost_fraction(open_ts) > round_trip_cost_fraction(midday_ts)
+
+
+def test_round_trip_cost_fraction_is_price_invariant():
+    # Every cost component here is a percentage of price/turnover, so the
+    # fraction shouldn't depend on the absolute price level -- verify by
+    # comparing net_pnl's own per-share result at two different prices.
+    ts = pd.Timestamp("2024-01-01 11:00")
+    fraction = round_trip_cost_fraction(ts)
+    cheap_stock_cost = -net_pnl(10.0, 10.0, 1, entry_ts=ts, exit_ts=ts)
+    expensive_stock_cost = -net_pnl(5000.0, 5000.0, 1, entry_ts=ts, exit_ts=ts)
+    assert cheap_stock_cost / 10.0 == pytest.approx(fraction)
+    assert expensive_stock_cost / 5000.0 == pytest.approx(fraction)
+
+
+def test_round_trip_cost_fraction_matches_zero_cost_config():
+    zero_costs = TransactionCosts(
+        brokerage_pct=0, stt_sell_pct=0, exchange_txn_pct=0, sebi_fee_pct=0,
+        stamp_duty_buy_pct=0, gst_pct=0, slippage_bps_per_leg=0,
+    )
+    assert round_trip_cost_fraction(costs=zero_costs) == 0

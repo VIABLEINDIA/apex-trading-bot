@@ -1,7 +1,11 @@
 import numpy as np
 import pandas as pd
 
-from src.features import FEATURE_COLUMNS, add_features, add_labels, build_training_set, latest_feature_row
+from src.costs import round_trip_cost_fraction
+from src.features import (
+    FEATURE_COLUMNS, add_features, add_labels, add_labels_cost_aware, build_training_set,
+    build_training_set_cost_aware, latest_feature_row,
+)
 
 
 def make_bars(n=80, seed=1):
@@ -102,3 +106,63 @@ def test_longer_horizon_drops_more_trailing_rows_than_default():
     longer_set = build_training_set(bars, horizon=5)
     # same warmup, but 5-bars-ahead loses 4 more trailing rows than 1-bar-ahead
     assert len(longer_set) <= len(default_set)
+
+
+def test_cost_aware_labels_only_contain_binary_values():
+    df = add_labels_cost_aware(add_features(make_bars()))
+    non_null = df["label"].dropna()
+    assert set(non_null.unique()) <= {0, 1}
+
+
+def test_cost_aware_dead_zone_matches_round_trip_cost_fraction():
+    df = add_labels_cost_aware(add_features(make_bars()))
+    next_return = df["Close"].shift(-1) / df["Close"] - 1
+    epsilon = pd.Series([round_trip_cost_fraction(ts) for ts in df.index], index=df.index)
+    dead_zone = next_return.abs() < epsilon
+    assert df.loc[dead_zone.fillna(False), "label"].isna().all()
+
+
+def test_cost_aware_dead_zone_is_wider_at_open_than_midday():
+    # A bar at the open needs a bigger move to clear the (wider) open-session
+    # slippage than an identical-sized move at midday -- build two bars with
+    # the exact same tiny forward return, one timestamped at the open, one
+    # midday, and confirm only the midday one clears its (narrower) dead zone.
+    open_idx = pd.date_range("2024-01-02 09:15", periods=30, freq="15min")
+    midday_idx = pd.date_range("2024-01-02 11:00", periods=30, freq="15min")
+    rng = np.random.default_rng(1)
+    close = 100 + np.cumsum(rng.normal(0, 0.01, 30))  # tiny moves only
+
+    def to_bars(idx):
+        return pd.DataFrame(
+            {"Open": close, "High": close + 0.05, "Low": close - 0.05, "Close": close,
+             "Volume": np.full(30, 2000.0)},
+            index=idx,
+        )
+
+    open_labels = add_labels_cost_aware(add_features(to_bars(open_idx)))["label"]
+    midday_labels = add_labels_cost_aware(add_features(to_bars(midday_idx)))["label"]
+    # same underlying price path -- a stricter (wider) dead zone at the open
+    # can only drop as many or more rows than the laxer midday one.
+    assert open_labels.notna().sum() <= midday_labels.notna().sum()
+
+
+def test_build_training_set_cost_aware_drops_warmup_and_dead_zone_rows():
+    bars = make_bars(n=80)
+    training_set = build_training_set_cost_aware(bars)
+    assert not training_set.empty
+    assert len(training_set) < len(bars)
+    assert set(training_set["label"].unique()) <= {0, 1}
+    assert training_set[FEATURE_COLUMNS].notna().all().all()
+
+
+def test_cost_aware_and_fixed_epsilon_labels_can_differ():
+    # Not a golden-value test (the whole point is the thresholds differ) --
+    # just confirms the two label sets aren't trivially identical, i.e. the
+    # cost-aware path is actually doing something different from the fixed
+    # LABEL_EPSILON path rather than silently degenerating to the same thing.
+    bars = make_bars(n=200, seed=7)
+    fixed = build_training_set(bars)
+    cost_aware = build_training_set_cost_aware(bars)
+    assert len(fixed) != len(cost_aware) or not fixed["label"].reset_index(drop=True).equals(
+        cost_aware["label"].reset_index(drop=True)
+    )

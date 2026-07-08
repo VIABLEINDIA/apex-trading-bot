@@ -131,6 +131,13 @@ def simulate(ticker_bars: dict, model: MomentumClassifier, start_date=None, benc
             portfolio.reset_day()
         current_date = ts_date
 
+        # No-op unless portfolio was built with a regime_gate (see
+        # src/regime.py:RealizedVolatilityGate) -- lets a point-in-time
+        # regime check answer "as of" this simulated instant instead of
+        # needing a wall clock. Must run before any evaluate_signal call
+        # below uses the regime_gate this iteration.
+        portfolio.on_timestamp(ts)
+
         for ticker in tickers_at_ts:
             price = float(ticker_features[ticker].loc[ts, "Close"])
             last_price_seen[ticker] = price
