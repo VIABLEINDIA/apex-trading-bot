@@ -155,6 +155,62 @@ def test_build_training_set_cost_aware_drops_warmup_and_dead_zone_rows():
     assert training_set[FEATURE_COLUMNS].notna().all().all()
 
 
+def test_clv_is_plus_one_when_close_at_high_and_minus_one_when_close_at_low():
+    idx = pd.date_range("2024-01-01 09:15", periods=3, freq="15min")
+    bars = pd.DataFrame(
+        {"Open": [100, 100, 100], "High": [110, 110, 110], "Low": [90, 90, 90],
+         "Close": [110, 90, 100], "Volume": [1000, 1000, 1000]},
+        index=idx,
+    )
+    clv = add_features(bars)["clv"]
+    assert clv.iloc[0] == 1.0    # closed at the high
+    assert clv.iloc[1] == -1.0   # closed at the low
+    assert clv.iloc[2] == 0.0    # closed at the midpoint
+
+
+def test_clv_is_neutral_zero_for_a_zero_range_bar():
+    # High == Low (a frozen/circuit-locked print) has no directional
+    # information -- must be filled with 0, not left NaN or raise via
+    # division by zero.
+    idx = pd.date_range("2024-01-01 09:15", periods=1, freq="15min")
+    bars = pd.DataFrame({"Open": [100.0], "High": [100.0], "Low": [100.0],
+                          "Close": [100.0], "Volume": [1000.0]}, index=idx)
+    assert add_features(bars)["clv"].iloc[0] == 0.0
+
+
+def test_clv_is_bounded_between_minus_one_and_one():
+    clv = add_features(make_bars(n=200, seed=3))["clv"]
+    assert clv.between(-1.0, 1.0).all()
+
+
+def test_amihud_illiquidity_nan_during_warmup_then_populated():
+    df = add_features(make_bars(n=30))
+    # pct_change() leaves row 0 undefined, so the rolling(window=14,
+    # min_periods=14) mean only has 14 valid returns to average from row 14
+    # onward -- one row later than volume_surge's own 10-bar warmup.
+    assert df["amihud_illiq_14"].iloc[:14].isna().all()
+    assert df["amihud_illiq_14"].iloc[14:].notna().all()
+
+
+def test_amihud_illiquidity_is_higher_for_the_same_move_at_lower_volume():
+    idx = pd.date_range("2024-01-01 09:15", periods=30, freq="15min")
+    rng = np.random.default_rng(2)
+    close = 100 + np.cumsum(rng.normal(0, 0.5, 30))
+
+    def to_bars(volume: float) -> pd.DataFrame:
+        return pd.DataFrame(
+            {"Open": close, "High": close + 0.1, "Low": close - 0.1, "Close": close,
+             "Volume": np.full(30, volume)},
+            index=idx,
+        )
+
+    low_volume_illiq = add_features(to_bars(500.0))["amihud_illiq_14"]
+    high_volume_illiq = add_features(to_bars(50_000.0))["amihud_illiq_14"]
+    # identical price path, so any difference is purely from the volume
+    # denominator -- the low-volume series must show higher illiquidity.
+    assert (low_volume_illiq.iloc[14:] > high_volume_illiq.iloc[14:]).all()
+
+
 def test_cost_aware_and_fixed_epsilon_labels_can_differ():
     # Not a golden-value test (the whole point is the thresholds differ) --
     # just confirms the two label sets aren't trivially identical, i.e. the

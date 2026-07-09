@@ -12,6 +12,17 @@ kind of short-horizon directional classification, and switches the label from
 raw sign-of-next-bar (mostly noise) to a dead-zone threshold so near-flat bars
 (which carry no tradeable edge net of costs) don't pollute training with
 effectively random labels.
+
+The technical-indicator set above still tops out at ~52% holdout accuracy
+regardless of label horizon, model regularization, or the training objective
+(absolute vs. cross-sectional -- see README "Model-signal sweep" and
+docs/decisions/0005), which points at the feature set itself, not the model,
+as the ceiling. `clv` and `amihud_illiq_14` are a first step towards genuinely
+different information: order-flow/microstructure-style proxies derived from
+OHLCV alone (no tick or order-book data available yet -- see README "Known
+limitations" on unverified broker feed fields), so they're backtestable with
+the existing walk-forward pipeline immediately rather than needing a new,
+currently-nonexistent historical data source.
 """
 import pandas as pd
 
@@ -28,6 +39,8 @@ FEATURE_COLUMNS = [
     "bb_pct_b",
     "atr_pct",
     "relative_strength",
+    "clv",
+    "amihud_illiq_14",
 ]
 
 # Next-bar moves smaller than this (as a fraction of price) are treated as
@@ -74,6 +87,40 @@ def _atr_pct(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
     return atr / close
 
 
+def _clv(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    """Close Location Value: where this bar's close fell within its own
+    High-Low range, from -1 (closed at the low) to +1 (closed at the high).
+    A standard order-flow-direction proxy (the basis of Chaikin Money Flow /
+    Accumulation-Distribution) computable from OHLC alone -- no tick or
+    order-book data needed, unlike a real signed-trade/order-flow feature.
+
+    A zero-range bar (High == Low -- a frozen or circuit-locked print) has no
+    directional information to give, so it's filled with 0 (neutral) rather
+    than left NaN, matching relative_strength's "no information" convention
+    for a structurally undefined case rather than a warm-up one.
+    """
+    bar_range = (high - low).replace(0, pd.NA)
+    return (((close - low) - (high - close)) / bar_range).fillna(0.0)
+
+
+def _amihud_illiquidity(close: pd.Series, volume: pd.Series, period: int = 14) -> pd.Series:
+    """Rolling Amihud (2002) illiquidity ratio: |return| per rupee of volume
+    traded, averaged over `period` bars. A higher value means the same-size
+    trade moves price further -- a price-impact/liquidity proxy distinct from
+    ATR (which measures absolute volatility, not volatility per unit of
+    volume traded), and computable from OHLCV alone.
+
+    A zero-volume bar has no defined ratio (division by zero), so that single
+    bar is excluded from the rolling mean rather than poisoning it -- pandas'
+    rolling mean already skips NaNs within the window as long as `min_periods`
+    non-null values remain, so no explicit fill is needed here.
+    """
+    abs_return = close.pct_change().abs()
+    dollar_volume = (close * volume).replace(0, pd.NA)
+    illiquidity = abs_return / dollar_volume
+    return illiquidity.rolling(window=period, min_periods=period).mean()
+
+
 def add_features(bars: pd.DataFrame, benchmark_close: pd.Series | None = None) -> pd.DataFrame:
     """Return a copy of `bars` with alpha feature columns appended.
 
@@ -103,6 +150,8 @@ def add_features(bars: pd.DataFrame, benchmark_close: pd.Series | None = None) -
     df["macd_hist"] = _macd_hist(df["Close"])
     df["bb_pct_b"] = _bollinger_pct_b(df["Close"])
     df["atr_pct"] = _atr_pct(df["High"], df["Low"], df["Close"])
+    df["clv"] = _clv(df["High"], df["Low"], df["Close"])
+    df["amihud_illiq_14"] = _amihud_illiquidity(df["Close"], df["Volume"], period=14)
 
     if benchmark_close is not None and not benchmark_close.empty:
         aligned_benchmark = benchmark_close.reindex(df.index, method="ffill")
