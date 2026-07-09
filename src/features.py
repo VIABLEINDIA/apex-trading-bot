@@ -113,10 +113,16 @@ def _amihud_illiquidity(close: pd.Series, volume: pd.Series, period: int = 14) -
     A zero-volume bar has no defined ratio (division by zero), so that single
     bar is excluded from the rolling mean rather than poisoning it -- pandas'
     rolling mean already skips NaNs within the window as long as `min_periods`
-    non-null values remain, so no explicit fill is needed here.
+    non-null values remain, so no explicit fill is needed here. Uses float
+    `nan` rather than `pd.NA` for that replacement: `pd.NA` silently upcasts
+    a float64 Series to `object` dtype (confirmed against a real zero-volume
+    bar, which only showed up once this ran against the full 500-ticker
+    universe -- illiquid names occasionally print a truly empty 15-min bar),
+    and `.rolling(...).mean()` raises `DataError: No numeric types to
+    aggregate` on an object-dtype Series instead of just skipping the NaN.
     """
     abs_return = close.pct_change().abs()
-    dollar_volume = (close * volume).replace(0, pd.NA)
+    dollar_volume = (close * volume).replace(0, float("nan"))
     illiquidity = abs_return / dollar_volume
     return illiquidity.rolling(window=period, min_periods=period).mean()
 
