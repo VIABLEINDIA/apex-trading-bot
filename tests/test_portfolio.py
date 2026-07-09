@@ -404,3 +404,56 @@ def test_kill_switch_resumes_trading_once_file_is_removed(tmp_path):
 
     kill_switch.unlink()
     assert pm.evaluate_signal("A.NS", confidence=0.90, price=100).approved
+
+
+def test_no_regime_gate_is_a_full_noop_by_default():
+    pm = make_pm()
+    assert pm.evaluate_signal("A.NS", confidence=0.90, price=100).approved
+
+
+def test_regime_gate_blocks_new_entries_when_it_returns_false():
+    pm = make_pm(regime_gate=lambda: False)
+    decision = pm.evaluate_signal("A.NS", confidence=0.90, price=100)
+    assert not decision.approved
+    assert "regime" in decision.reason
+
+
+def test_regime_gate_allows_trading_when_it_returns_true():
+    pm = make_pm(regime_gate=lambda: True)
+    assert pm.evaluate_signal("A.NS", confidence=0.90, price=100).approved
+
+
+def test_regime_gate_is_reevaluated_on_every_call():
+    state = {"ok": False}
+    pm = make_pm(regime_gate=lambda: state["ok"])
+    assert not pm.evaluate_signal("A.NS", confidence=0.90, price=100).approved
+
+    state["ok"] = True
+    assert pm.evaluate_signal("A.NS", confidence=0.90, price=100).approved
+
+
+def test_regime_gate_object_with_check_method_is_used_over_bare_call():
+    class Gate:
+        def check(self):
+            return False
+
+    pm = make_pm(regime_gate=Gate())
+    assert not pm.evaluate_signal("A.NS", confidence=0.90, price=100).approved
+
+
+def test_on_timestamp_is_a_noop_without_a_regime_gate():
+    pm = make_pm()
+    pm.on_timestamp(pd.Timestamp("2024-01-01 09:15"))  # must not raise
+
+
+def test_on_timestamp_forwards_to_regime_gate():
+    calls = []
+
+    class FakeGate:
+        def on_timestamp(self, timestamp):
+            calls.append(timestamp)
+
+    pm = make_pm(regime_gate=FakeGate())
+    ts = pd.Timestamp("2024-01-01 09:15")
+    pm.on_timestamp(ts)
+    assert calls == [ts]

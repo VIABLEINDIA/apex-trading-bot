@@ -1,5 +1,6 @@
 """Compare the existing absolute-direction model against a cross-sectional
-ranking reformulation, on the same held-out window, fetching data only once.
+ranking reformulation, across several holdout windows, fetching data and
+computing features only once.
 
 Why this exists: scripts/tune_model.py already showed that neither a cleaner
 label horizon nor a more regularized GBM moves holdout accuracy off ~52% --
@@ -10,16 +11,36 @@ objective* to match what scripts/paper_trade.py's simulate() already does at
 strongest-confidence-first across the whole watchlist. That's a
 cross-sectional ranking, but the model has only ever been trained to answer
 "will this go up in isolation", never "will this outperform its peers right
-now". See src/cross_sectional.py and docs/decisions/ for the full rationale.
+now". See src/cross_sectional.py and docs/decisions/0005 for the full
+rationale and the single-window result that motivated this multi-window run:
+one 14-day window showed cross-sectional beating the absolute baseline, but
+this project already watched an analogous single-window result (BALU, see
+docs/decisions/0003) flip entirely under a proper multi-window sweep. This
+script is that sweep, applied to the cross-sectional question.
 
-Both variants are evaluated with the ATR-stop mechanism OFF and full-day
+Every variant is evaluated with the ATR-stop mechanism OFF and full-day
 session/sizing (same as tune_model.py's methodology), to isolate model-signal
 differences from risk-parameter effects.
 
+Also sweeps a fourth variant per window: `cross_sectional_ensemble_q20_q30`
+(src/model.py:EnsembleMomentumClassifier), which averages the q20 and q30
+models' confidence instead of committing to either quantile setting. This is
+the multi-window sweep that motivated adding the ensemble class in the first
+place -- q20 and q30 have no single consistent winner across windows, which
+is exactly the setting-sensitivity an ensemble is meant to smooth out.
+
+Cost note: feature computation (add_features per ticker) and cross-sectional
+rank labeling both only depend on the fetched history, never on which window
+is being evaluated -- a stock's rank at time T depends only on other stocks'
+returns at that same T, not on any train/test cutoff. So both are computed
+ONCE regardless of how many --holdout-days values are given; only the GBM
+training (which does depend on the cutoff, since it only sees pre-cutoff
+rows) is repeated per (window, variant) pair.
+
 Usage:
-    python scripts/tune_model_cross_sectional.py
-    python scripts/tune_model_cross_sectional.py --days 30 --holdout-days 10
-    python scripts/tune_model_cross_sectional.py RELIANCE.NS TCS.NS ...   # explicit tickers, faster iteration
+    python scripts/tune_model_cross_sectional.py                                # sweeps 7/14/21/28-day holdouts
+    python scripts/tune_model_cross_sectional.py --days 59 --holdout-days 7 14
+    python scripts/tune_model_cross_sectional.py RELIANCE.NS TCS.NS ... --holdout-days 7   # explicit tickers, faster iteration
 """
 import argparse
 import logging
@@ -27,13 +48,14 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+from sklearn.ensemble import GradientBoostingClassifier
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.cross_sectional import build_cross_sectional_training_set  # noqa: E402
-from src.features import FEATURE_COLUMNS  # noqa: E402
+from src.features import FEATURE_COLUMNS, add_features, add_labels  # noqa: E402
 from src.market_data import fetch_bars_by_ticker, fetch_benchmark_close  # noqa: E402
-from src.model import MomentumClassifier  # noqa: E402
+from src.model import EnsembleMomentumClassifier, MomentumClassifier  # noqa: E402
 from src.portfolio import PortfolioManager  # noqa: E402
 from src.screener import load_universe  # noqa: E402
 from src.universe import load_sector_map  # noqa: E402
@@ -46,109 +68,176 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
-def run_absolute_baseline(ticker_bars: dict, benchmark_close, cutoff: pd.Timestamp) -> tuple[str, float, dict]:
-    """The existing baseline_h1_default_gbm variant from tune_model.py,
-    trained on this run's own pre-cutoff data (not a prior run's numbers --
-    tune_strategy.py already showed results swing hugely just from the
-    trailing window shifting between runs, so a fair comparison needs both
-    variants trained on the exact same fetch)."""
-    from src.features import add_features, add_labels
-
-    variant = build_absolute_baseline_variant()[0]  # baseline_h1_default_gbm
-    ticker_full_features = {
-        ticker: add_features(bars, benchmark_close=benchmark_close) for ticker, bars in ticker_bars.items()
-    }
+def train_baseline_for_cutoff(ticker_full_features: dict, epsilon: float, horizon: int,
+                               gbm_params: dict, cutoff: pd.Timestamp) -> tuple[float, MomentumClassifier | None]:
+    """Re-labels (cheap) and trains (not cheap) on whatever's before `cutoff`
+    in the already-featurized (expensive, precomputed once) frames."""
     train_frames = []
-    for ticker, full_features in ticker_full_features.items():
+    for full_features in ticker_full_features.values():
         pre_cutoff = full_features[full_features.index.normalize() < cutoff]
         if pre_cutoff.empty:
             continue
-        labeled = add_labels(pre_cutoff, epsilon=variant["epsilon"], horizon=variant["horizon"])
-        labeled = labeled.dropna(subset=FEATURE_COLUMNS + ["label"])
+        labeled = add_labels(pre_cutoff, epsilon=epsilon, horizon=horizon).dropna(subset=FEATURE_COLUMNS + ["label"])
         if not labeled.empty:
             train_frames.append(labeled)
 
-    from sklearn.ensemble import GradientBoostingClassifier
-    classifier = MomentumClassifier(model=GradientBoostingClassifier(**variant["gbm_params"]))
+    if not train_frames:
+        return float("nan"), None
+
+    classifier = MomentumClassifier(model=GradientBoostingClassifier(**gbm_params))
     report = classifier.train_multi(train_frames)
-    return "absolute_baseline", report["accuracy"], classifier
+    return report["accuracy"], classifier
 
 
-def run_cross_sectional_variant(ticker_bars: dict, benchmark_close, cutoff: pd.Timestamp,
-                                 top_quantile: float, bottom_quantile: float) -> tuple[str, float, MomentumClassifier]:
-    """Rank labels are computed over the FULL fetched range (each row's label
-    only depends on other tickers' returns at that SAME timestamp, never a
-    future one, so there's no leakage from including post-cutoff timestamps
-    in this call) -- only the *training* rows are then filtered to pre-cutoff."""
-    full_labeled = build_cross_sectional_training_set(
-        ticker_bars, benchmark_close=benchmark_close, top_quantile=top_quantile, bottom_quantile=bottom_quantile,
-    )
+def train_cross_sectional_for_cutoff(full_labeled: pd.DataFrame, cutoff: pd.Timestamp) -> tuple[float, MomentumClassifier | None]:
+    """Filters the already-rank-labeled (expensive, precomputed once) frame
+    to pre-cutoff rows and trains on just that slice."""
     train_set = full_labeled[full_labeled["timestamp"].dt.normalize() < cutoff]
-    label = f"cross_sectional_q{int(top_quantile * 100)}"
     if train_set.empty:
-        logger.warning("No training data for %s, skipping.", label)
-        return label, float("nan"), None
+        return float("nan"), None
 
     classifier = MomentumClassifier()
     report = classifier.train_prelabeled(train_set.reset_index(drop=True), test_size=0.2)
-    return label, report["accuracy"], classifier
+    return report["accuracy"], classifier
+
+
+def run_and_record(all_results: list, holdout_days: int, label: str, accuracy: float, classifier,
+                    ticker_bars: dict, benchmark_close: pd.Series, sector_map: dict, cutoff: pd.Timestamp,
+                    member_accuracies: dict | None = None) -> dict:
+    """Shared "backtest one trained classifier, record it, log it" sequence
+    used both for each individual variant and for the ensemble built from
+    them -- keeps the two from silently drifting apart (e.g. a future kwarg
+    change to simulate() only applied to one of the two call sites)."""
+    portfolio = PortfolioManager(
+        sector_map=sector_map, primary_session_end="15:30", continuation_session_end="15:30",
+    )
+    result = simulate(
+        ticker_bars, classifier, start_date=cutoff, benchmark_close=benchmark_close,
+        portfolio=portfolio, use_atr_stop=False, log_to_db=False,
+    )
+    all_results.append((holdout_days, label, accuracy, result))
+    suffix = f" (member accs: {member_accuracies})" if member_accuracies is not None else ""
+    logger.info(
+        "[%dd] %s: trades=%d gross=%.2f (%.1f%% WR) net=%.2f (%.1f%% WR)%s",
+        holdout_days, label, result["total_trades"], result["total_pnl"], result["win_rate"] * 100,
+        result["total_net_pnl"], result["net_win_rate"] * 100, suffix,
+    )
+    return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tickers", nargs="*", help="Tickers to tune on. Defaults to the full universe.")
     parser.add_argument("--days", type=int, default=59, help="Total lookback window in days.")
-    parser.add_argument("--holdout-days", type=int, default=14, help="Trailing days held out as the OOS test window.")
+    parser.add_argument("--holdout-days", type=int, nargs="+", default=[7, 14, 21, 28],
+                        help="One or more trailing-day holdout windows to sweep (same set as the README tables).")
     args = parser.parse_args()
 
     tickers = args.tickers or load_universe()
-    logger.info("Fetching %d days of 15m bars for %d tickers (ONCE, reused across every variant)...",
+    logger.info("Fetching %d days of 15m bars for %d tickers (ONCE, reused across every window and variant)...",
                 args.days, len(tickers))
     ticker_bars = fetch_bars_by_ticker(tickers, args.days)
     benchmark_close = fetch_benchmark_close(args.days)
-
     last_date = max(bars.index.max() for bars in ticker_bars.values()).normalize()
-    cutoff = last_date - pd.Timedelta(days=args.holdout_days)
-    logger.info("Train window: < %s | Held-out test window: >= %s", cutoff.date(), cutoff.date())
 
+    logger.info("Precomputing features once per ticker (reused across every window and variant)...")
+    ticker_full_features = {
+        ticker: add_features(bars, benchmark_close=benchmark_close) for ticker, bars in ticker_bars.items()
+    }
+
+    logger.info("Precomputing cross-sectional rank labels once per quantile setting "
+                "(ranks only depend on same-timestamp returns, never on a cutoff)...")
+    cross_sectional_frames = {
+        "cross_sectional_q20": build_cross_sectional_training_set(
+            ticker_bars, benchmark_close=benchmark_close, top_quantile=0.2, bottom_quantile=0.2,
+        ),
+        "cross_sectional_q30": build_cross_sectional_training_set(
+            ticker_bars, benchmark_close=benchmark_close, top_quantile=0.3, bottom_quantile=0.3,
+        ),
+    }
+    # Single source of truth for which labels are cross-sectional quantile
+    # variants -- used below both to build their entries in `variants` and to
+    # decide ensemble membership, so adding/renaming a quantile setting here
+    # is the only place that needs to change (previously the same two label
+    # strings were hardcoded again separately at both use sites).
+    quantile_labels = list(cross_sectional_frames.keys())
+
+    baseline_variant = build_absolute_baseline_variant()[0]  # baseline_h1_default_gbm
     sector_map = load_sector_map()
-    results = []
+    all_results = []  # (holdout_days, variant_label, accuracy, result)
 
-    variants = [
-        ("absolute_baseline", lambda: run_absolute_baseline(ticker_bars, benchmark_close, cutoff)),
-        ("cross_sectional_q30", lambda: run_cross_sectional_variant(ticker_bars, benchmark_close, cutoff, 0.3, 0.3)),
-        ("cross_sectional_q20", lambda: run_cross_sectional_variant(ticker_bars, benchmark_close, cutoff, 0.2, 0.2)),
-    ]
+    for holdout_days in args.holdout_days:
+        cutoff = last_date - pd.Timedelta(days=holdout_days)
+        logger.info("=== Holdout window: %d days (train < %s, test >= %s) ===",
+                    holdout_days, cutoff.date(), cutoff.date())
 
-    for name, build_fn in variants:
-        logger.info("--- Variant: %s ---", name)
-        label, accuracy, classifier = build_fn()
-        if classifier is None:
+        variants = [
+            ("absolute_baseline", lambda: train_baseline_for_cutoff(
+                ticker_full_features, baseline_variant["epsilon"], baseline_variant["horizon"],
+                baseline_variant["gbm_params"], cutoff,
+            )),
+        ] + [
+            (label, lambda label=label: train_cross_sectional_for_cutoff(cross_sectional_frames[label], cutoff))
+            for label in quantile_labels
+        ]
+
+        quantile_classifiers: dict[str, MomentumClassifier] = {}
+        quantile_accuracies: dict[str, float] = {}
+        for label, train_fn in variants:
+            accuracy, classifier = train_fn()
+            if classifier is None:
+                logger.warning("No training data for %s at %d-day holdout, skipping.", label, holdout_days)
+                continue
+            logger.info("[%dd] %s: holdout accuracy=%.3f", holdout_days, label, accuracy)
+            if label in quantile_labels:
+                quantile_classifiers[label] = classifier
+                quantile_accuracies[label] = accuracy
+
+            run_and_record(all_results, holdout_days, label, accuracy, classifier,
+                            ticker_bars, benchmark_close, sector_map, cutoff)
+
+        # Ensemble across every quantile setting in cross_sectional_frames
+        # (src/model.py:EnsembleMomentumClassifier): motivated by exactly
+        # this sweep -- q20 and q30 have no single consistent winner across
+        # windows, which is the setting-sensitivity an ensemble is meant to
+        # smooth out rather than betting on whichever quantile happens to
+        # win this particular window. Only runs if every quantile setting
+        # trained successfully; members are derived from quantile_labels
+        # (the same list used to build `variants` above), not a hardcoded
+        # pair, so adding a third quantile setting to cross_sectional_frames
+        # automatically includes it here without touching this block.
+        if len(quantile_classifiers) == len(quantile_labels) and len(quantile_labels) > 1:
+            ensemble_label = "cross_sectional_ensemble_" + "_".join(
+                l.removeprefix("cross_sectional_") for l in quantile_labels
+            )
+            ensemble = EnsembleMomentumClassifier([quantile_classifiers[l] for l in quantile_labels])
+            avg_accuracy = sum(quantile_accuracies.values()) / len(quantile_accuracies)
+            run_and_record(all_results, holdout_days, ensemble_label, avg_accuracy, ensemble,
+                            ticker_bars, benchmark_close, sector_map, cutoff,
+                            member_accuracies=quantile_accuracies)
+
+    logger.info("\n--- Multi-window sweep results (grouped by holdout window) ---")
+    for holdout_days in args.holdout_days:
+        logger.info("Holdout: %d days", holdout_days)
+        window_results = [r for r in all_results if r[0] == holdout_days]
+        window_results.sort(key=lambda r: r[3]["total_net_pnl"], reverse=True)
+        for _, label, accuracy, result in window_results:
+            logger.info(
+                "  %-25s holdout_acc=%.3f  net=%9.2f (%.1f%% WR, %d trades)  gross=%9.2f (%.1f%% WR)",
+                label, accuracy, result["total_net_pnl"], result["net_win_rate"] * 100, result["total_trades"],
+                result["total_pnl"], result["win_rate"] * 100,
+            )
+
+    logger.info("\n--- Wins by variant (how often each variant was least-bad across all windows tested) ---")
+    win_counts: dict[str, int] = {}
+    for holdout_days in args.holdout_days:
+        window_results = [r for r in all_results if r[0] == holdout_days]
+        if not window_results:
             continue
-        logger.info("%s: holdout accuracy=%.3f", label, accuracy)
-
-        portfolio = PortfolioManager(
-            sector_map=sector_map, primary_session_end="15:30", continuation_session_end="15:30",
-        )
-        result = simulate(
-            ticker_bars, classifier, start_date=cutoff, benchmark_close=benchmark_close,
-            portfolio=portfolio, use_atr_stop=False, log_to_db=False,
-        )
-        results.append((label, accuracy, result))
-        logger.info(
-            "%s: trades=%d gross=%.2f (%.1f%% WR) net=%.2f (%.1f%% WR)",
-            label, result["total_trades"], result["total_pnl"], result["win_rate"] * 100,
-            result["total_net_pnl"], result["net_win_rate"] * 100,
-        )
-
-    results.sort(key=lambda r: r[2]["total_net_pnl"], reverse=True)
-    logger.info("\n--- Ranked by net PnL (best first) ---")
-    for label, accuracy, result in results:
-        logger.info(
-            "%-25s holdout_acc=%.3f  net=%9.2f (%.1f%% WR, %d trades)  gross=%9.2f (%.1f%% WR)",
-            label, accuracy, result["total_net_pnl"], result["net_win_rate"] * 100, result["total_trades"],
-            result["total_pnl"], result["win_rate"] * 100,
-        )
+        best_label = max(window_results, key=lambda r: r[3]["total_net_pnl"])[1]
+        win_counts[best_label] = win_counts.get(best_label, 0) + 1
+    for label, count in sorted(win_counts.items(), key=lambda kv: kv[1], reverse=True):
+        logger.info("  %-25s best in %d/%d windows", label, count, len(args.holdout_days))
 
 
 if __name__ == "__main__":

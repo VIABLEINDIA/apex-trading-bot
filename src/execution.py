@@ -208,24 +208,64 @@ def reconcile_fill(client: "KotakNeoClient", order_id: str, expected_quantity: i
 
 
 class TickBarAggregator:
-    """Resamples raw tick messages into rolling 15-minute OHLCV bars per ticker,
-    so the AI engine always has a fresh DataFrame to featurize.
+    """Aggregates raw tick messages into rolling 15-minute OHLCV bars per
+    ticker, so the AI engine always has a fresh DataFrame to featurize.
+
+    Each tick is folded directly into its bar in O(1) (`add_tick`), instead of
+    keeping every raw tick and re-resampling the whole history from scratch on
+    every call. That resample-from-scratch approach made `get_bars` O(ticks
+    seen so far), and it's called on every single tick for every ticker in
+    `live_session.py` -- across a ~300-ticker watchlist and a 6.25-hour
+    session, that's O(n^2) growth in the number of ticks per ticker, not O(n).
+    `get_bars` is now O(bars so far) -- ~25/day, regardless of tick volume.
     """
 
     def __init__(self, bar_interval: str = "15min"):
         self.bar_interval = bar_interval
-        self._ticks: dict[str, list[dict]] = defaultdict(list)
+        # ticker -> {bar_start_timestamp: {"Open", "High", "Low", "Close",
+        # "Volume", "_open_ts", "_close_ts"}}. The two trailing timestamp
+        # fields (stripped before get_bars returns) are what let Open/Close
+        # be resolved by each tick's own timestamp rather than by the order
+        # add_tick happens to be called in -- see add_tick below.
+        self._bars: dict[str, dict[pd.Timestamp, dict]] = defaultdict(dict)
 
     def add_tick(self, ticker: str, price: float, volume: float, timestamp: pd.Timestamp) -> None:
-        self._ticks[ticker].append({"timestamp": timestamp, "price": price, "volume": volume})
+        bar_start = timestamp.floor(self.bar_interval)
+        bar = self._bars[ticker].get(bar_start)
+        if bar is None:
+            self._bars[ticker][bar_start] = {
+                "Open": price, "High": price, "Low": price, "Close": price, "Volume": volume,
+                "_open_ts": timestamp, "_close_ts": timestamp,
+            }
+        else:
+            bar["High"] = max(bar["High"], price)
+            bar["Low"] = min(bar["Low"], price)
+            bar["Volume"] += volume
+            # Open/Close must track the earliest/latest *timestamp* seen for
+            # this bar, not the order add_tick happens to be called in --
+            # ticks can arrive out of order (network jitter, a broker SDK
+            # that doesn't guarantee delivery order). Open uses strict < so
+            # that on an exact-timestamp tie, whichever tick set Open first
+            # keeps it (the true opening print isn't clobbered by a same-
+            # instant tick processed later); Close uses >= so the most
+            # recently processed tick wins ties, since Close is meant to
+            # track the latest observation for this bar regardless of
+            # processing order.
+            if timestamp < bar["_open_ts"]:
+                bar["Open"] = price
+                bar["_open_ts"] = timestamp
+            if timestamp >= bar["_close_ts"]:
+                bar["Close"] = price
+                bar["_close_ts"] = timestamp
 
     def get_bars(self, ticker: str) -> pd.DataFrame:
-        ticks = self._ticks.get(ticker, [])
-        if not ticks:
+        bars = self._bars.get(ticker)
+        if not bars:
             return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
-        df = pd.DataFrame(ticks).set_index("timestamp")
-        bars = df["price"].resample(self.bar_interval).ohlc()
-        bars["Volume"] = df["volume"].resample(self.bar_interval).sum()
-        bars.columns = ["Open", "High", "Low", "Close", "Volume"]
-        return bars.dropna(subset=["Close"])
+        df = pd.DataFrame.from_dict(bars, orient="index")
+        df.index = pd.DatetimeIndex(df.index, name="timestamp")
+        # Matches the old resample-based implementation's guarantee that a
+        # NaN-Close bar (e.g. built from a malformed/NaN-price tick that
+        # slipped past the caller's own validation) is never returned.
+        return df.sort_index()[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])

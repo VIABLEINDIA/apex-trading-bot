@@ -88,6 +88,7 @@ class PortfolioManager:
         continuation_size_mult: float | None = None,
         max_consecutive_losses: int | None = None,
         kill_switch_path: str | None = None,
+        regime_gate: object | None = None,
     ):
         self.total_capital = total_capital if total_capital is not None else settings.risk.total_capital
         self.max_slots = max_slots if max_slots is not None else settings.risk.max_slots
@@ -141,6 +142,21 @@ class PortfolioManager:
         self.kill_switch_path = (
             kill_switch_path if kill_switch_path is not None else settings.risk.kill_switch_path
         )
+        # Optional market-regime gate: pauses new entries (existing positions
+        # still exit normally) independent of the model's own signal. None
+        # (the default) is a full no-op, matching the pattern of every other
+        # optional gate here (sector_map, timestamp, atr): existing callers
+        # that don't supply one are unaffected. A single object covers both
+        # halves of the gate -- a zero-arg `check() -> bool` (or, for a
+        # simple stateless gate, just being directly callable) and an
+        # optional `on_timestamp(timestamp)` for gates that need to know
+        # "as of when" (see src/regime.py:RealizedVolatilityGate) -- one
+        # parameter rather than two that a caller would otherwise have to
+        # keep in sync by hand. Not wired into any default pipeline
+        # (paper_trade.py/live_session.py) since it hasn't been backtested
+        # yet -- same "implemented but unvalidated" caveat as the ATR-stop
+        # mechanism, see docs/decisions/0003.
+        self.regime_gate = regime_gate
 
         self.active_trades: dict[str, Trade] = {}
         # (date, hour) -> count. Bucketed on the timestamp the *caller* passes
@@ -302,6 +318,19 @@ class PortfolioManager:
     def is_kill_switch_engaged(self) -> bool:
         return bool(self.kill_switch_path) and Path(self.kill_switch_path).exists()
 
+    def on_timestamp(self, timestamp) -> None:
+        """Optional per-simulated-timestamp hook: forwards to
+        `regime_gate.on_timestamp(timestamp)` if a regime_gate was supplied
+        AND it exposes that method (a plain stateless callable/gate has
+        nothing to update), otherwise a no-op. A backtest has no wall clock,
+        so a regime check that needs "as of when" (like RealizedVolatilityGate)
+        can't just call pd.Timestamp.now() the way live code could --
+        scripts/paper_trade.py's simulate() calls this once per simulated
+        timestamp, before evaluating any signals at that instant, so the gate
+        can answer using only history up to that point (no look-ahead)."""
+        if self.regime_gate is not None and hasattr(self.regime_gate, "on_timestamp"):
+            self.regime_gate.on_timestamp(timestamp)
+
     def evaluate_signal(self, ticker: str, confidence: float, price: float, timestamp=None,
                         current_prices: dict[str, float] | None = None, atr: float | None = None) -> Decision:
         """Gatekeeper check run before any order is routed to the exchange.
@@ -328,6 +357,11 @@ class PortfolioManager:
 
         if self.is_kill_switch_engaged():
             return Decision(False, "kill switch engaged")
+
+        if self.regime_gate is not None:
+            regime_check = self.regime_gate.check if hasattr(self.regime_gate, "check") else self.regime_gate
+            if not regime_check():
+                return Decision(False, "unfavorable market regime")
 
         if self.consecutive_losses >= self.max_consecutive_losses:
             return Decision(False, f"consecutive loss limit reached ({self.max_consecutive_losses})")

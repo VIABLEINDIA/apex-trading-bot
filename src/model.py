@@ -115,3 +115,32 @@ class MomentumClassifier:
         path = path or settings.model_path
         model = joblib.load(path)
         return cls(model=model)
+
+
+class EnsembleMomentumClassifier:
+    """Averages predict_confidence across several independently-trained
+    MomentumClassifier members, instead of committing to any single one of
+    them. Motivated by scripts/tune_model_cross_sectional.py's multi-window
+    sweep: different cross-sectional quantile settings (e.g. q20 vs q30) won
+    on different holdout windows, with no single setting winning
+    consistently -- exactly the kind of setting-sensitivity an ensemble is
+    meant to smooth out, rather than betting on whichever one happened to
+    win the last backtest.
+
+    Same interface as MomentumClassifier (predict_confidence/is_buy_signal),
+    so it's a drop-in for scripts/paper_trade.py's simulate() or
+    src/live_session.py -- callers don't need to know whether they're
+    holding one model or several.
+    """
+
+    def __init__(self, members: list[MomentumClassifier]):
+        if not members:
+            raise ValueError("EnsembleMomentumClassifier needs at least one member")
+        self.members = members
+
+    def predict_confidence(self, feature_row: pd.DataFrame) -> float:
+        return sum(m.predict_confidence(feature_row) for m in self.members) / len(self.members)
+
+    def is_buy_signal(self, feature_row: pd.DataFrame) -> tuple[bool, float]:
+        confidence = self.predict_confidence(feature_row)
+        return confidence > settings.risk.confidence_threshold, confidence
