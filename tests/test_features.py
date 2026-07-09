@@ -211,6 +211,24 @@ def test_amihud_illiquidity_is_higher_for_the_same_move_at_lower_volume():
     assert (low_volume_illiq.iloc[14:] > high_volume_illiq.iloc[14:]).all()
 
 
+def test_amihud_illiquidity_survives_a_real_zero_volume_bar():
+    # A genuinely zero-volume 15-min bar (an illiquid stock with no trades
+    # in that window) must not crash add_features -- caught only once this
+    # ran against the full 500-ticker universe: `.replace(0, pd.NA)` quietly
+    # upcasts the Series to object dtype, and rolling().mean() then raises
+    # DataError("No numeric types to aggregate") instead of just treating
+    # the bar as undefined.
+    bars = make_bars(n=30, seed=4)
+    bars.iloc[10, bars.columns.get_loc("Volume")] = 0.0
+
+    df = add_features(bars)  # must not raise
+
+    assert df["amihud_illiq_14"].dtype == np.float64
+    # the zero-volume bar rolls out of the trailing 14-bar window well before
+    # the series ends, so later rows must still produce a real, finite value.
+    assert df["amihud_illiq_14"].iloc[-1] == df["amihud_illiq_14"].iloc[-1]  # not NaN
+
+
 def test_cost_aware_and_fixed_epsilon_labels_can_differ():
     # Not a golden-value test (the whole point is the thresholds differ) --
     # just confirms the two label sets aren't trivially identical, i.e. the
